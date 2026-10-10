@@ -1,403 +1,144 @@
 #!/usr/bin/env python3
-"""
-Personalized Care Management Agent — localhost web UI (Demo 1 of 4).
+"""Personalized Care Management Agent -- localhost web UI (stdlib only).
 
-STDLIB ONLY: uses http.server + subprocess + json. No Flask, no Streamlit,
-no pip installs, no network access beyond localhost.
-
-Run:
-    python3 app.py
-Then open in Chrome:  http://localhost:8001
-
-Endpoints:
-    GET /         -> the single-page demo UI (inline HTML/CSS/JS)
-    GET /api/run  -> executes `python3 demo.py` and returns its stdout
-                     as JSON: {"ok": true, "output": "..."}
-
-This file does not change demo.py's behavior; it only runs it as a
-subprocess and displays its output.
+Run:  python3 app.py   then open http://localhost:8001
+Serves a guided, personalized tour of demo.py (the tested artifact --
+demo.py is never modified here; it is only imported as a module and its
+canned subprocess run is unchanged).
 """
 
-import errno
+import contextlib
+import http.server
+import io
 import json
+import re
 import subprocess
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
 from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8001
-DEMO_TIMEOUT_SECONDS = 120
-
 HERE = Path(__file__).resolve().parent
 DEMO_PY = HERE / "demo.py"
 
-# ---------------------------------------------------------------------------
-# Single-page UI: inline CSS/JS, zero external assets.
-# ---------------------------------------------------------------------------
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Personalized Care Management Agent &mdash; Live Demo</title>
-<style>
-  :root {
-    --bg: #0f172a;
-    --panel: #111c33;
-    --panel-border: #1e2d4d;
-    --text: #e2e8f0;
-    --muted: #94a3b8;
-    --accent: #38bdf8;
-    --accent-dark: #0369a1;
-    --green: #34d399;
-    --term-bg: #060b18;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-                 Helvetica, Arial, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    line-height: 1.5;
-  }
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 60px; }
-  header {
-    background: linear-gradient(135deg, #0c4a6e, #1e3a8a);
-    border: 1px solid var(--panel-border);
-    border-radius: 14px;
-    padding: 26px 28px;
-    margin-bottom: 22px;
-  }
-  header h1 { margin: 0 0 8px; font-size: 1.65rem; }
-  header h1 .badge {
-    display: inline-block; vertical-align: middle;
-    font-size: 0.72rem; font-weight: 700;
-    background: rgba(255,255,255,.14);
-    border: 1px solid rgba(255,255,255,.25);
-    border-radius: 999px; padding: 3px 10px; margin-left: 10px;
-    letter-spacing: .04em;
-  }
-  header p { margin: 0; color: #cbd5e1; max-width: 62ch; }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 14px;
-    padding: 20px 22px;
-    margin-bottom: 22px;
-  }
-  .card h2 { margin: 0 0 10px; font-size: 1.1rem; }
-  .card h2 .num {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 26px; height: 26px; border-radius: 50%;
-    background: var(--accent-dark); color: #fff;
-    font-size: .85rem; margin-right: 8px;
-  }
-  button.run {
-    display: inline-flex; align-items: center; gap: 10px;
-    background: var(--accent); color: #04121f;
-    border: 0; border-radius: 10px;
-    font-size: 1rem; font-weight: 700;
-    padding: 12px 22px; cursor: pointer;
-  }
-  button.run:hover { background: #7dd3fc; }
-  button.run:disabled { opacity: .55; cursor: default; }
-  .hint { color: var(--muted); font-size: .9rem; margin: 10px 0 0; }
-  /* Terminal-like trace panel */
-  .term {
-    background: var(--term-bg);
-    border: 1px solid #1e293b;
-    border-radius: 10px;
-    padding: 16px 18px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: .83rem; line-height: 1.55;
-    white-space: pre-wrap; word-break: break-word;
-    max-height: 640px; overflow-y: auto;
-    color: #cbd5e1;
-  }
-  .term .divider { color: #475569; }
-  .term .act { color: var(--accent); font-weight: 700; }
-  .term .plan {
-    display: block;
-    background: rgba(56, 189, 248, .08);
-    border-left: 3px solid var(--accent);
-    padding: 8px 12px; margin: 8px 0;
-    color: #e0f2fe;
-  }
-  .term .plan .plan-tag {
-    display: inline-block; font-weight: 800;
-    background: var(--accent-dark); color: #fff;
-    border-radius: 4px; padding: 0 8px; margin-right: 8px;
-    font-size: .72rem; letter-spacing: .06em;
-  }
-  .term .step { color: var(--green); font-weight: 600; }
-  .term .msg { color: #f1f5f9; }
-  .term .ok-line { color: var(--green); font-weight: 700; }
-  .term .err { color: #f87171; font-weight: 700; }
-  .placeholder { color: #64748b; font-style: italic; }
-  /* Results panel */
-  #results .cols { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-  @media (max-width: 760px) { #results .cols { grid-template-columns: 1fr; } }
-  .patient {
-    background: #0b1426; border: 1px solid var(--panel-border);
-    border-radius: 10px; padding: 14px 16px;
-  }
-  .patient h3 { margin: 0 0 6px; font-size: 1rem; }
-  .patient .tier {
-    display: inline-block; font-size: .75rem; font-weight: 800;
-    border-radius: 999px; padding: 2px 10px; margin-bottom: 8px;
-    letter-spacing: .05em;
-  }
-  .tier-high { background: #7f1d1d; color: #fecaca; }
-  .tier-medium { background: #78350f; color: #fde68a; }
-  .tier-low { background: #064e3b; color: #a7f3d0; }
-  .patient dl { margin: 0; font-size: .88rem; }
-  .patient dt { color: var(--muted); float: left; width: 92px; }
-  .patient dd { margin: 0 0 4px 98px; color: var(--text); }
-  /* Spinner */
-  .spinner {
-    display: inline-block; width: 16px; height: 16px;
-    border: 3px solid rgba(4,18,31,.25); border-top-color: #04121f;
-    border-radius: 50%; animation: spin 0.8s linear infinite;
-    vertical-align: -3px;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .status { margin-top: 10px; font-size: .9rem; color: var(--muted); }
-  footer { color: #64748b; font-size: .82rem; margin-top: 8px; }
-</style>
-</head>
-<body>
-<div class="wrap">
+sys.path.insert(0, str(HERE))
+import demo as DEMO  # the tested artifact: imported, never modified
 
-  <header>
-    <h1>Personalized Care Management Agent
-      <span class="badge">DEMO 1 OF 4 &middot; AGENTIC AI WORKSHOP</span></h1>
-    <p>One-line story: instead of one generic health blast sent to every
-    patient, five agents &mdash; Auth, Triage, Channel, Care Plan, Message
-    &mdash; verify, risk-triage, and personally message each patient.</p>
-  </header>
+COND_RE = re.compile(
+    r"(type 2 diabetes|type 1 diabetes|diabetes|hypertension|high blood pressure|"
+    r"kidney disease|ckd|heart disease|depression|asthma|arthritis|copd|hyperlipidemia)"
+)
 
-  <div class="card">
-    <h2><span class="num">1</span>Run the demo</h2>
-    <button class="run" id="runBtn" onclick="runDemo()">Run live demo</button>
-    <p class="hint">Runs <code>python3 demo.py</code> on this machine and
-    streams the agent trace below. Fully deterministic &mdash; same output
-    every run.</p>
-    <div class="status" id="status"></div>
-  </div>
+def _capture_canned():
+    """Run the canned demo exactly as before (subprocess), capture stdout."""
+    proc = subprocess.run(
+        [sys.executable, str(DEMO_PY)],
+        cwd=str(HERE),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    return proc.stdout or proc.stderr
 
-  <div class="card">
-    <h2><span class="num">2</span>Agent trace</h2>
-    <div class="term" id="trace">
-      <span class="placeholder">Press &ldquo;Run live demo&rdquo; and the
-      full agent trace will appear here.</span>
-    </div>
-  </div>
+def _capture_fn(fn, params):
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            return fn(params)
+    except Exception as exc:  # never crash the page on a bad input
+        return "[web-ui] The personalized run hit an error and stopped safely.\n%s: %s" % (type(exc).__name__, exc)
 
-  <div class="card" id="results" style="display:none">
-    <h2><span class="num">3</span>Results</h2>
-    <div class="cols">
-      <div class="patient">
-        <span class="tier tier-high">HIGH RISK &middot; 75</span>
-        <h3>Priya Sharma</h3>
-        <dl>
-          <dt>Conditions</dt><dd>Type 2 Diabetes + Hypertension</dd>
-          <dt>Channel</dt><dd>Email (patient preference)</dd>
-          <dt>Outcome</dt><dd>Full personalized email + 7-day follow-up CTA</dd>
-        </dl>
-      </div>
-      <div class="patient">
-        <span class="tier tier-medium">MEDIUM RISK &middot; 35</span>
-        <h3>Maria Garcia</h3>
-        <dl>
-          <dt>Conditions</dt><dd>Type 2 Diabetes + Chronic Kidney Disease</dd>
-          <dt>Channel</dt><dd>SMS (patient preference)</dd>
-          <dt>Outcome</dt><dd>Short texts with the top 2 actions</dd>
-        </dl>
-      </div>
-      <div class="patient">
-        <span class="tier tier-low">LOW RISK &middot; 10</span>
-        <h3>James Carter</h3>
-        <dl>
-          <dt>Conditions</dt><dd>Hypertension</dd>
-          <dt>Channel</dt><dd>Phone (patient preference)</dd>
-          <dt>Outcome</dt><dd>Call script for the care manager</dd>
-        </dl>
-      </div>
-    </div>
-    <p class="hint">Deterministic canned output &mdash; same scores, tiers
-    and messages on every run. Educational demo; condition playbooks are
-    simplified teaching examples, not medical advice.</p>
-  </div>
+# ---- personalized run: input handling lives in app.py; demo.py untouched ----
 
-  <footer>
-    localhost only &middot; stdlib only (http.server) &middot; no network,
-    no API keys &middot; demo output rendered from the real
-    <code>demo.py</code> subprocess.
-  </footer>
-</div>
+def run_custom(params):
+    name = (params.get("name") or "Guest").strip() or "Guest"
+    conds = (params.get("conditions") or "").strip() or "no conditions listed"
+    chan = (params.get("channel") or "email").strip().lower()
+    if chan not in ("email", "sms", "phone"):
+        chan = "email"
+    cflags = sorted(set(c for c in COND_RE.findall(conds.lower())))
+    patient = {
+        "id": "WEB-001",
+        "name": name,
+        "age": 50,
+        "email": f"{re.sub(r'[^a-z0-9]', '', name.lower()) or 'guest'}@example.com",
+        "conditions": conds,
+        "last_visit": "not provided",
+        "preferred_channel": chan,
+        "risk_factors": {"from_user_input": True},
+    }
+    for c in cflags:
+        patient["risk_factors"][c] = 1
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print("=" * 70)
+        print("YOUR RUN -- the five-agent pipeline triages YOUR input")
+        print(f"You told us: name={name} | conditions={conds} | channel={chan}")
+        print(f"Condition flags the agent will weigh: {', '.join(cflags) or '(none matched the known list -- see the honesty note below)'}")
+        print("=" * 70)
+        DEMO.run_agentic_flow(patient, [])
+        print()
+        print("Honesty note: the risk tier and plan above come from the same rule-based")
+        print("pipeline the canned demo uses (run_agentic_flow, demo.py -- unchanged). The")
+        print("agent matches your free text against the known condition list (type 1/2")
+        print("diabetes, hypertension, kidney disease, heart disease, depression, asthma,")
+        print("arthritis, COPD, hyperlipidemia); anything else is passed through as-is.")
+    return out.getvalue()
 
-<script>
-function esc(s) {
-  return s.replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;");
-}
+PAGE = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>Personalized Care Management Agent &mdash; Live Demo</title>\n<style>\n:root{\n  --bg:#0b1220; --bg2:#0e1626; --panel:#131e33; --panel2:#182742;\n  --ink:#eaf0f9; --muted:#9db0c9; --faint:#6b7f99;\n  --teal:#2dd4bf; --teal-dim:rgba(45,212,191,.12);\n  --accent:#5aa9ff; --warn:#fbbf24; --danger:#f87171; --ok:#34d399;\n  --line:#233451; --radius:14px;\n}\n*{box-sizing:border-box}\nbody{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;\n  background:var(--bg);color:var(--ink);line-height:1.6}\nheader{background:linear-gradient(135deg,#0a2540 0%,#0e3a5c 60%,#0b4f4a 100%);\n  padding:42px 32px 34px;border-bottom:1px solid var(--line)}\n.wrap{max-width:1060px;margin:0 auto}\nheader h1{margin:0 0 8px;font-size:30px;letter-spacing:-.01em}\nheader .sub{margin:0;color:#c8d6ea;font-size:16px;max-width:800px}\n.badge{display:inline-block;margin-top:14px;font-size:11.5px;letter-spacing:.1em;\n  text-transform:uppercase;color:#06281f;background:var(--teal);\n  padding:5px 14px;border-radius:999px;font-weight:800}\nmain{padding:8px 32px 48px}\nsection.card{background:var(--panel);border:1px solid var(--line);\n  border-radius:var(--radius);padding:26px 28px;margin:26px 0}\nsection.card h2{margin:0 0 12px;font-size:18px;color:var(--teal)}\nsection.card h2 .n{display:inline-block;width:28px;height:28px;border-radius:50%;\n  background:var(--teal-dim);border:1px solid var(--teal);color:var(--teal);\n  text-align:center;line-height:26px;font-size:14px;margin-right:10px}\nsection.card p{margin:0 0 12px;color:#d5e0f1;font-size:15.5px}\nsection.card p:last-child{margin-bottom:0}\n.watch{list-style:none;margin:6px 0 0;padding:0}\n.watch li{position:relative;padding:8px 0 8px 30px;color:#d5e0f1;font-size:15px;\n  border-bottom:1px dashed var(--line)}\n.watch li:last-child{border-bottom:0}\n.watch li::before{content:"\\25b8";position:absolute;left:8px;color:var(--teal);font-weight:700}\nlabel.f{display:block;margin:14px 0 6px;font-size:13px;font-weight:700;\n  letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}\ninput[type=text],input[type=number],select,textarea{\n  width:100%;background:var(--bg2);border:1px solid var(--line);color:var(--ink);\n  border-radius:10px;padding:11px 14px;font-size:15px;font-family:inherit}\ntextarea{min-height:76px;resize:vertical}\ninput:focus,select:focus,textarea:focus{outline:none;border-color:var(--teal)}\n.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n@media(max-width:700px){.row2{grid-template-columns:1fr}}\n.btnrow{display:flex;gap:14px;align-items:center;margin-top:20px;flex-wrap:wrap}\nbutton.run{background:linear-gradient(135deg,#14b8a6,#0d9488);border:0;\n  color:#04211c;font-weight:800;font-size:17px;padding:15px 34px;\n  border-radius:12px;cursor:pointer;box-shadow:0 6px 22px rgba(45,212,191,.25)}\nbutton.run:hover{filter:brightness(1.08)}\nbutton.run:disabled{opacity:.45;cursor:default;box-shadow:none}\nbutton.ghost{background:transparent;border:1px solid var(--teal);color:var(--teal);\n  font-weight:700;font-size:15px;padding:13px 26px;border-radius:12px;cursor:pointer}\nbutton.ghost:hover{background:var(--teal-dim)}\nbutton.ghost:disabled{opacity:.45;cursor:default}\n.hint{color:var(--muted);font-size:13.5px}\n.spinner{display:none;align-items:center;gap:10px;color:var(--muted);font-size:14px;margin-top:14px}\n.spinner.show{display:flex}\n.dot{width:12px;height:12px;border-radius:50%;background:var(--teal);\n  animation:pulse 1s infinite ease-in-out}\n@keyframes pulse{0%,100%{transform:scale(.6);opacity:.5}50%{transform:scale(1.2);opacity:1}}\n#output{display:none;margin-top:6px}\n#output.show{display:block}\n.out{background:#0a0f1c;border:1px solid var(--line);border-radius:12px;\n  padding:20px 22px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\n  font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;\n  max-height:640px;overflow:auto;color:#c9d6ea}\n.sechead{color:var(--accent);font-weight:800;margin:18px 0 2px;font-size:13.5px}\n.sechead:first-child{margin-top:0}\n.seccap{background:var(--teal-dim);border-left:3px solid var(--teal);\n  padding:8px 12px;margin:4px 0 12px;border-radius:0 8px 8px 0;\n  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;\n  font-size:13.5px;color:#bfe9e2}\n.tok-orch{color:var(--accent);font-weight:700}\n.tok-tool{color:var(--ok);font-weight:700}\n.tok-guard{color:var(--warn);font-weight:700}\n.tok-mem{color:#c084fc;font-weight:700}\n#takeaways{display:none}\n#takeaways.show{display:block}\n.take{background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.4);\n  border-radius:var(--radius);padding:22px 26px;margin:26px 0}\n.take h2{color:var(--ok);margin:0 0 10px;font-size:18px}\n.take ul{margin:0;padding-left:20px}\n.take li{margin:8px 0;color:#d5e0f1;font-size:15px}\ntable.dec{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}\ntable.dec th{background:var(--panel2);color:var(--teal);text-align:left;\n  padding:10px 12px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;\n  border-bottom:1px solid var(--line)}\ntable.dec td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}\n.pill{display:inline-block;padding:3px 12px;border-radius:999px;font-weight:800;font-size:12px}\n.pill.v{background:var(--ok);color:#04281c}\n.pill.s{background:var(--faint);color:#0b1220}\nfooter{padding:26px 32px 40px;color:var(--faint);font-size:13.5px;text-align:center}\nfooter a{color:var(--teal);text-decoration:none}\nfooter a:hover{text-decoration:underline}\ndetails.raw{margin-top:14px}\ndetails.raw summary{cursor:pointer;color:var(--muted);font-size:13.5px}\n</style>\n</head>\n<body>\n<header><div class="wrap">\n  <h1>Personalized Care Management Agent</h1>\n  <p class="sub">From one generic blast email to a personal care plan for every patient.</p>\n  <span class="badge">DEMO 1 OF 8 · AGENTIC AI WORKSHOP</span>\n</div></header>\n<main><div class="wrap">\n\n<section class="card" id="story">\n  <h2><span class="n">1</span>The story</h2>\n  <p>Care teams doing health outreach have one legacy tool: the generic blast. One message — <i>"Get yourself checked. Visit a physician."</i> — sent to every patient. The patient with uncontrolled diabetes gets the exact same note as a healthy 45-year-old. It is cheap to send and nearly useless to receive.</p>\n<p>This demo shows the before and after. First the prior-era blast, then five agents — <b>Auth</b>, <b>Triage</b>, <b>Channel</b>, <b>Care Plan</b>, <b>Message</b> — working three fictional patients: Priya Sharma (diabetes + hypertension, prefers email), Maria Garcia (diabetes + kidney disease, prefers SMS), James Carter (hypertension, prefers a phone call). Each gets a risk tier and a message on the channel they will actually read.</p>\n</section>\n\n<section class="card" id="watch">\n  <h2><span class="n">2</span>What to watch for</h2>\n  <ul class="watch">\n<li>Watch the same five-agent pipeline run three times — and produce three different risk tiers (HIGH, MEDIUM, LOW) from the same rules.</li>\n<li>Notice how the channel changes per patient: email for Priya, SMS for Maria, a phone-call script for James.</li>\n<li>In Act 3, compare the generic blast side-by-side with the personalized plans — the whole business case on one screen.</li>\n  </ul>\n</section>\n\n\n\n<section class="card" id="tryown">\n  <h2><span class="n">✎</span>Try your own</h2>\n  <p>Give the agent your own details and it will triage <b>you</b> — same five-agent pipeline, same rules, personalized plan and message.</p>\n  <label class="f" for="c_name">Your name</label>\n  <input type="text" id="c_name" value="Alex Morgan">\n  <label class="f" for="c_cond">Your health conditions (free text)</label>\n  <input type="text" id="c_cond" value="type 2 diabetes, high blood pressure">\n  <label class="f" for="c_chan">How should we reach you?</label>\n  <select id="c_chan">\n    <option value="email">Email</option>\n    <option value="sms">SMS (text message)</option>\n    <option value="phone">Phone call</option>\n  </select>\n  <div class="btnrow">\n    <button class="ghost" id="customRun">Triage me</button>\n    <span class="hint">Same inputs → same output. Deterministic.</span>\n  </div>\n  <div class="spinner" id="cspin"><div class="dot"></div>Personalizing your care plan…</div>\n</section>\n\n\n<section class="card" id="runbox">\n  <h2><span class="n">3</span>Run the demo</h2>\n  <p>Click below to run the full canned demonstration. It takes a few seconds.</p>\n  <div class="btnrow">\n    <button class="run" id="run">&#9654; Run live demo</button>\n  </div>\n  <div class="spinner" id="spin"><div class="dot"></div><span>The five agents are triaging the three patients…</span></div>\n  <div id="output">\n    <div class="out" id="outtext"></div>\n    <details class="raw"><summary>Show raw terminal output</summary>\n      <div class="out" id="rawtext"></div>\n    </details>\n  </div>\n</section>\n\n<section class="card" id="takeaways" style="display:none">\n  <div class="take">\n    <h2>What just happened</h2>\n    <ul>\n<li>One pipeline, three different outcomes: the agents produced HIGH, MEDIUM, and LOW risk tiers from identical rules — personalization comes from the data, not from hand-writing.</li>\n<li>Channel matters as much as content: the same plan delivered by email, SMS, or phone script reaches different patients.</li>\n<li>The side-by-side in Act 3 is the business case: generic outreach is cheap to send and nearly useless to receive.</li>\n<li>Try it on yourself: type your name and conditions in “Try your own” above and watch the same five agents triage you.</li>\n    </ul>\n  </div>\n</section>\n\n</div></main>\n<footer><div class="wrap">\n  <a href="https://github.com/ynpreet/agentic-care-management" target="_blank" rel="noopener">View the project on GitHub</a>\n  &nbsp;&middot;&nbsp; All data in this demo is synthetic / fictional.\n</div></footer>\n\n<script>\nconst SECTIONS = [["ACT 1", "The prior era: one generic message blasted to every patient \\u2014 no name, no condition, no next step."], ["ACT 2", "The agentic era: five agents triage and personalize, one patient at a time."], ["PATIENT 1/3", "Priya Sharma: Auth verifies her login, Triage scores her risk, Channel picks email \\u2014 then her personal plan and message."], ["PATIENT 2/3", "Maria Garcia: the same pipeline, a different patient \\u2014 different tier, different channel (SMS)."], ["PATIENT 3/3", "James Carter: the lowest risk of the three, but he still gets a plan \\u2014 on his preferred channel, a phone script."], ["ACT 3", "Side-by-side: the blast versus the personalized plans. This is the entire argument in one screen."]];\nfunction esc(s){return s.replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\');}\nfunction decorate(line){\n  let h = esc(line);\n  h = h.replace(/\\[ORCHESTRATOR\\]/g,\'<span class="tok-orch">[ORCHESTRATOR]</span>\');\n  h = h.replace(/\\[TOOL [^\\]]+\\]/g,function(m){return \'<span class="tok-tool">\'+m+\'</span>\';});\n  h = h.replace(/\\[MEMORY\\]/g,\'<span class="tok-mem">[MEMORY]</span>\');\n  h = h.replace(/GUARDRAIL/g,\'<span class="tok-guard">GUARDRAIL</span>\');\n  return h;\n}\nfunction renderOut(text){\n  document.getElementById(\'rawtext\').textContent = text;\n  const lines = text.split(\'\\n\');\n  let html = \'\';\n  for(const line of lines){\n    let matched = null;\n    for(const s of SECTIONS){ if(line.indexOf(s.m) !== -1){ matched = s; break; } }\n    if(matched){\n      html += \'<div class="sechead">\'+decorate(line)+\'</div>\'+\n              \'<div class="seccap">\'+matched.c+\'</div>\';\n      continue;\n    }\n    html += decorate(line) + \'\\n\';\n  }\n  document.getElementById(\'outtext\').innerHTML = html;\n  document.getElementById(\'output\').classList.add(\'show\');\n  document.getElementById(\'output\').scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\nfunction showTakeaways(){\n  const t = document.getElementById(\'takeaways\');\n  t.style.display=\'block\'; t.classList.add(\'show\');\n  t.scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\ndocument.getElementById(\'run\').addEventListener(\'click\',function(){\n  const btn=this, spin=document.getElementById(\'spin\');\n  btn.disabled=true; spin.classList.add(\'show\');\n  fetch(\'/api/run\').then(r=>r.json()).then(j=>{\n    spin.classList.remove(\'show\'); btn.disabled=false;\n    renderOut(j.output);\n    if(typeof loadDecisionTable===\'function\') loadDecisionTable();\n    showTakeaways();\n  }).catch(e=>{spin.classList.remove(\'show\');btn.disabled=false;alert(\'Run failed: \'+e);});\n});\n\nfunction collectCustom(){\n  return {name:document.getElementById(\'c_name\').value,\n          conditions:document.getElementById(\'c_cond\').value,\n          channel:document.getElementById(\'c_chan\').value};\n}\n\nfunction wireCustom(){\n  const b=document.getElementById(\'customRun\');\n  if(!b) return;\n  b.addEventListener(\'click\',function(){\n    const spin=document.getElementById(\'cspin\');\n    b.disabled=true; spin.classList.add(\'show\');\n    fetch(\'/api/custom\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n      body:JSON.stringify(collectCustom())})\n    .then(r=>r.json()).then(j=>{\n      spin.classList.remove(\'show\'); b.disabled=false;\n      if(j.error){alert(j.error);return;}\n      renderOut(j.output); showTakeaways();\n    }).catch(e=>{spin.classList.remove(\'show\');b.disabled=false;alert(\'Run failed: \'+e);});\n  });\n}\nwireCustom();\n</script>\n</body>\n</html>\n'
 
-function renderTrace(text) {
-  var lines = text.split("\\n");
-  var html = [];
-  var inPlan = false;
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i];
-    var e = esc(line);
-    if (/^[=]{10,}/.test(line)) { html.push('<span class="divider">' + e + '</span>'); inPlan = false; continue; }
-    if (/^ACT \\d/.test(line))   { html.push('<span class="act">' + e + '</span>'); continue; }
-    if (/^PATIENT \\d/.test(line)){ html.push('<span class="act">' + e + '</span>'); continue; }
-    if (/^Story:/.test(line))    { inPlan = true;
-      html.push('<span class="plan"><span class="plan-tag">PLAN</span>' + e.replace(/^Story:\\s*/, '') + '</span>');
-      continue; }
-    if (inPlan && line.trim() === '') { inPlan = false; html.push(e); continue; }
-    if (inPlan) { html.push('<span class="plan">' + e + '</span>'); continue; }
-    if (/^\\[\\w+Agent\\]/.test(line)) { html.push('<span class="step">' + e + '</span>'); continue; }
-    if (/^Demo complete/.test(line)) { html.push('<span class="ok-line">' + e + '</span>'); continue; }
-    if (/^Subject:|^Hi |^CALL SCRIPT/.test(line)) { html.push('<span class="msg">' + e + '</span>'); continue; }
-    html.push(e);
-  }
-  return html.join("\\n");
-}
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "WorkshopUI/1.0"
 
-function runDemo() {
-  var btn = document.getElementById('runBtn');
-  var status = document.getElementById('status');
-  var trace = document.getElementById('trace');
-  var results = document.getElementById('results');
-  btn.disabled = true;
-  results.style.display = 'none';
-  status.innerHTML = '<span class="spinner"></span> Running the agent pipeline&hellip;';
-  trace.innerHTML = '<span class="placeholder">Running <code>python3 demo.py</code>&hellip;</span>';
-  fetch('/api/run')
-    .then(function (r) { return r.json(); })
-    .then(function (data) {
-      if (data.ok) {
-        trace.innerHTML = renderTrace(data.output);
-        results.style.display = 'block';
-        status.textContent = 'Done — the demo exited 0. Trace rendered above.';
-      } else {
-        trace.innerHTML = '<span class="err">Demo failed: ' + esc(data.error || 'unknown error') + '</span>';
-        status.textContent = 'The demo run failed — see the trace panel.';
-      }
-    })
-    .catch(function (err) {
-      trace.innerHTML = '<span class="err">Request failed: ' + esc(String(err)) + '</span>';
-      status.textContent = 'Could not reach the server. Is app.py still running?';
-    })
-    .finally(function () { btn.disabled = false; });
-}
-</script>
-</body>
-</html>
-"""
-
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
-class DemoHandler(BaseHTTPRequestHandler):
-    server_version = "CareDemo/1.0"
-
-    def _send_json(self, obj, status=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_html(self):
-        body = PAGE.encode("utf-8")
+    def _send(self, body, ctype="text/html; charset=utf-8"):
+        data = body.encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(data)
 
-    def do_GET(self):  # noqa: N802 (http.server naming convention)
-        path = self.path.split("?", 1)[0]
-        if path == "/":
-            self._send_html()
-        elif path == "/api/run":
-            self._run_demo()
-        else:
-            self.send_error(404, "Not found")
+    def _json(self, obj):
+        self._send(json.dumps(obj), "application/json; charset=utf-8")
 
-    def _run_demo(self):
-        """Execute `python3 demo.py` as a subprocess, return its stdout."""
+    def _read_json(self):
         try:
-            proc = subprocess.run(
-                ["python3", str(DEMO_PY)],
-                cwd=str(HERE),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=DEMO_TIMEOUT_SECONDS,
-            )
-        except FileNotFoundError:
-            self._send_json(
-                {"ok": False, "error": "python3 not found on PATH."},
-                status=500,
-            )
-            return
-        except subprocess.TimeoutExpired:
-            self._send_json(
-                {"ok": False,
-                 "error": f"demo.py timed out after "
-                          f"{DEMO_TIMEOUT_SECONDS} seconds."},
-                status=500,
-            )
-            return
-        if proc.returncode != 0:
-            self._send_json(
-                {"ok": False,
-                 "error": f"demo.py exited with code {proc.returncode}: "
-                          f"{proc.stderr.strip()}"},
-                status=500,
-            )
-            return
-        self._send_json({"ok": True, "output": proc.stdout})
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
 
-    def log_message(self, fmt, *args):  # quieter logs
-        sys.stderr.write(f"[app] {self.address_string()} {fmt % args}\n")
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(PAGE)
+        elif path == "/api/run":
+            self._json({"output": _capture_canned()})
+        else:
+            self.send_error(404, "not found")
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/custom":
+            params = self._read_json()
+            self._json({"output": _capture_fn(run_custom, params)})
+        else:
+            self.send_error(404, "not found")
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("ui: " + (fmt % args) + "\n")
 
 
 def main():
-    print(f"Personalized Care Management Agent — web UI (port {PORT})",
-          flush=True)
-    print("Serving demo.py output; demo itself is untouched.", flush=True)
-    try:
-        server = HTTPServer((HOST, PORT), DemoHandler)
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            print(f"\nERROR: port {PORT} is already in use.", file=sys.stderr)
-            print(
-                "Another instance of `python3 app.py` may already be running.\n"
-                "Find its PID with `lsof -ti:8001` and stop it with "
-                "`kill <PID>`, or pick a free port, then try again.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        raise
-    print()
-    print("============================================================", flush=True)
-    print(f"  Open in Chrome: http://localhost:{PORT}", flush=True)
-    print("============================================================", flush=True)
-    print("Press Ctrl-C to stop.\n", flush=True)
+    server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    print("Personalized Care Management Agent demo UI -> http://localhost:8001")
+    print("Press Ctrl-C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down.")
-    finally:
-        server.server_close()
+        print("\nstopped.")
 
 
 if __name__ == "__main__":
