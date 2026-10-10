@@ -1,0 +1,3 @@
+# Requirements for the OPTIONAL Streamlit UI (app.py) only.
+# demo.py uses pure Python stdlib and needs nothing installed.
+streamlit==1.39.0
