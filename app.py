@@ -109,6 +109,22 @@ _CONDITION_MAP = [
     (("gout",), "Gout", 5),
 ]
 
+# Hypertension is also reported as "blood pressure ... high" with verbs and
+# intensifiers in between ("my blood pressure has been very high"). The
+# substring aliases above miss that word order, so a targeted regex covers it.
+# A positive reading between the anchors ("is normal", "is low") vetoes the
+# match, so "my blood pressure is fine" never scores. Negated segments are
+# already blanked by _strip_negations before this runs.
+_BP_HIGH_RE = re.compile(r"\b(blood pressure|bp)\b(.*?)\bhigh\b")
+_BP_POSITIVE_RE = re.compile(r"\b(normal|low|good|fine|okay|ok|controlled|stable)\b")
+
+
+def _bp_intensifier_high(clean):
+    """True when 'blood pressure ... high' is asserted with no positive
+    reading intervening."""
+    m = _BP_HIGH_RE.search(clean)
+    return bool(m) and not _BP_POSITIVE_RE.search(m.group(2))
+
 _HIGH_TIER_AT = 50
 _MEDIUM_TIER_AT = 25
 
@@ -307,6 +323,10 @@ def _map_phrases(phrase):
                 if display not in found or weight > found[display]:
                     found[display] = weight
                 break
+    # Natural-language intensifier phrasing the substring aliases miss.
+    if _bp_intensifier_high(clean):
+        if "Hypertension" not in found or 15 > found["Hypertension"]:
+            found["Hypertension"] = 15
     return list(found.items())
 
 
