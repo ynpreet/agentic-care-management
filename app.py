@@ -42,8 +42,25 @@ _CRITICAL_PATTERNS = [
     (r"\bbleeding\b", "bleeding"),
     (r"\bseizures?\b", "seizure"),
     (r"suicid|self-?harm|kill myself|end my life|end it all", "self-harm risk"),
+    (r"\b(want to die|wish (i was|i were) dead|better off dead)\b", "self-harm risk"),
+    (r"\b(hurt|harm|cut)\s+(myself|my\s+self)\b", "self-harm risk"),
+    (r"\bkill\s+(you|him|her|them|someone|somebody|people|others?)\b", "threat to others"),
+    (r"\b(hurt|harm|attack|stab|shoot)\s+(you|him|her|them|someone|somebody|people|others?)\b", "threat to others"),
+    (r"\bmurder\b", "threat to others"),
+    (r"\b(going to|gonna)\s+kill\b", "threat to others"),
     (r"\boverdose\b", "overdose"),
     (r"anaphyla", "anaphylaxis"),
+]
+
+# Requests for OTHER patients' data. The personalized endpoint can never see
+# the roster, but the request must be declined explicitly (privacy guard) --
+# never processed as a health condition or echoed into a routine message.
+_PRIVACY_PATTERNS = [
+    r"every patient", r"all patients", r"other patients", r"another patient",
+    r"list of patients", r"patient list", r"patient roster", r"full roster",
+    r"show me.*patients?", r"patients?.*(name|email).*(list|show|give|tell)",
+    r"someone else'?s (data|record|information)",
+    r"\bphi\b",
 ]
 
 _WELLNESS_PATTERNS = [
@@ -447,6 +464,21 @@ def _run_custom_body(name, raw, chan, email, first):
         print("IMPORTANT: this demo is not medical advice. It cannot diagnose or")
         print("treat you. For anything urgent, call your doctor, your specialist,")
         print("or emergency services right away.")
+        return
+
+    # Gate 1b -- privacy: requests for OTHER patients' data are refused
+    # explicitly. Nothing is listed, shown, or disclosed, and no routine
+    # care plan is generated for the request itself.
+    if any(re.search(p, low) for p in _PRIVACY_PATTERNS):
+        print("=" * 70)
+        print("[AuthAgent]    Login verified: " + email)
+        print("[PrivacyGuard] DATA-ACCESS REQUEST DECLINED.")
+        print("               This demo never shares another patient's name,")
+        print("               email address, conditions, or risk scores -- not")
+        print("               listed, not summarized, not compared. Nothing was")
+        print("               disclosed. If you want triage for YOURSELF, describe")
+        print("               your own conditions above.")
+        print("=" * 70)
         return
 
     # Gate 2 -- explicit wellness / no conditions.
